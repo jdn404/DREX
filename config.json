@@ -1,0 +1,8 @@
+{
+  "concurrency": 500,
+  "timeout": 8,
+  "retry": 3,
+  "validate_rounds": 2,
+  "save_auto": true,
+  "theme": "green"
+}
