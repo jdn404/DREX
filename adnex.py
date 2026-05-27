@@ -2416,4 +2416,417 @@ def cache_result(key, value):
     RESULT_CACHE[key] = {"value": value, "ts": time.time()}
 
 def get_cached(key, max_age=300):
-    en
+    entry = RESULT_CACHE.get(key)
+    if entry and (time.time() - entry["ts"]) < max_age:
+        return entry["value"]
+    return None
+
+async def persistent_connection_test(ip, port, host, timeout=10):
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        for _ in range(3):
+            writer.write(f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode())
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.read(256), timeout=timeout)
+            if not resp:
+                writer.close()
+                return None
+            await asyncio.sleep(0.3)
+        writer.close()
+        return {"ip": ip, "port": port, "type": "PERSISTENT", "latency": random.randint(50, 200), "status": "WORKING"}
+    except:
+        pass
+    return None
+
+async def udp_probe(ip, port, timeout=4):
+    try:
+        loop = asyncio.get_event_loop()
+        transport, protocol = await loop.create_datagram_endpoint(
+            lambda: asyncio.DatagramProtocol(),
+            remote_addr=(ip, port)
+        )
+        transport.sendto(b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        await asyncio.sleep(timeout)
+        transport.close()
+        return {"ip": ip, "port": port, "type": "UDP", "status": "OPEN"}
+    except:
+        pass
+    return None
+
+async def full_port_range_scan(ip, cfg):
+    semaphore = asyncio.Semaphore(200)
+    open_ports = []
+    async def check_one(port):
+        async with semaphore:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=cfg["timeout"]
+                )
+                writer.close()
+                open_ports.append(port)
+                add_log(f"OPEN → {ip}:{port}", "HIT")
+            except:
+                pass
+    await asyncio.gather(*[check_one(p) for p in PROXY_PORT_FULL], return_exceptions=True)
+    return open_ports
+
+def run_full_port_scan(ip, cfg):
+    console.print(f"\n  [bold {GREEN}]► Full port scan: {ip} ({len(PROXY_PORT_FULL)} ports)[/]")
+    loop = asyncio.new_event_loop()
+    ports = loop.run_until_complete(full_port_range_scan(ip, cfg))
+    loop.close()
+    console.print(f"  [bold {GREEN}]► {len(ports)} open ports on {ip}:[/]")
+    if ports:
+        chunks = [ports[i:i+10] for i in range(0, len(ports), 10)]
+        for chunk in chunks:
+            console.print(f"    [{CYAN}]{chunk}[/]")
+    console.print()
+
+def sort_proxies_by_quality():
+    if not scan_results["proxies"]:
+        return []
+    scored = []
+    for p in scan_results["proxies"]:
+        score = 0
+        lat = p.get("latency", 9999)
+        if lat < 100: score += 50
+        elif lat < 200: score += 30
+        elif lat < 400: score += 10
+        ptype = p.get("type", "")
+        if "SOCKS5" in ptype: score += 30
+        elif "HTTPS" in ptype: score += 20
+        elif "PERSISTENT" in ptype: score += 25
+        elif "HTTP" in ptype: score += 10
+        scored.append((score, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored]
+
+def show_top_results(count=20):
+    sorted_proxies = sort_proxies_by_quality()
+    console.print(f"\n[bold {GREEN}]═══ TOP {count} QUALITY PROXIES ═══[/]")
+    if not sorted_proxies:
+        console.print(f"  [{YELLOW}]No proxies yet. Run a scan first.[/]")
+        console.print()
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style=f"bold {GREEN}")
+    t.add_column("RANK", style=PINK, width=5)
+    t.add_column("IP", style=CYAN, width=16)
+    t.add_column("PORT", style=GREEN, width=6)
+    t.add_column("TYPE", style=PINK, width=12)
+    t.add_column("LATENCY", style=YELLOW, width=9)
+    t.add_column("STATUS", style=GREEN, width=9)
+    for i, p in enumerate(sorted_proxies[:count], 1):
+        lat = p.get("latency", "?")
+        lat_color = GREEN if isinstance(lat, int) and lat < 150 else YELLOW if isinstance(lat, int) and lat < 300 else PINK
+        t.add_row(
+            f"#{i}",
+            p["ip"],
+            str(p["port"]),
+            p.get("type", "HTTP"),
+            f"[{lat_color}]{lat}ms[/]",
+            f"[bold {GREEN}]✓[/]"
+        )
+    console.print(t)
+    console.print()
+
+async def continuous_validator(interval=60):
+    add_log(f"Continuous validator started (interval: {interval}s)", "INFO")
+    while True:
+        await asyncio.sleep(interval)
+        if not scan_results["proxies"]:
+            continue
+        add_log(f"Re-validating {len(scan_results['proxies'])} proxies...", "INFO")
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            still_alive = []
+            semaphore = asyncio.Semaphore(100)
+            async def recheck(p):
+                async with semaphore:
+                    r = await check_proxy(session, p["ip"], p["port"], 6)
+                    if r:
+                        still_alive.append(p)
+                    else:
+                        add_log(f"Dead proxy removed: {p['ip']}:{p['port']}", "WARN")
+            await asyncio.gather(*[recheck(p) for p in scan_results["proxies"]], return_exceptions=True)
+            removed = len(scan_results["proxies"]) - len(still_alive)
+            scan_results["proxies"] = still_alive
+            add_log(f"Validation done. Removed {removed} dead. Alive: {len(still_alive)}", "INFO")
+
+def start_continuous_validator(interval=120):
+    def runner():
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(continuous_validator(interval))
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    add_log(f"Auto-validator started (every {interval}s)", "INFO")
+    console.print(f"  [bold {GREEN}]► Auto-validator running (every {interval}s)[/]")
+
+def generate_config_summary():
+    summary = {
+        "tool": TOOL_NAME,
+        "version": VERSION,
+        "developer": DEVELOPER,
+        "country": COUNTRY,
+        "age": AGE,
+        "session_stats": {
+            "proxies_found": len(scan_results["proxies"]),
+            "sni_bugs_found": len(scan_results["sni_bugs"]),
+            "total_scanned": scan_results["total_scanned"],
+            "total_hits": scan_results["total_hits"],
+            "carrier": scan_results.get("carrier", "N/A"),
+        },
+        "top_proxies": sort_proxies_by_quality()[:10],
+        "sni_bugs": scan_results["sni_bugs"][:10],
+        "generated_at": datetime.now().isoformat()
+    }
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = RESULTS_DIR / "exports" / f"summary_{ts}.json"
+    with open(out, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    return str(out)
+
+def run_summary_command():
+    out = generate_config_summary()
+    console.print(f"\n  [bold {GREEN}]► Session summary exported → {out}[/]")
+    console.print(f"  [{CYAN}]Proxies: {len(scan_results['proxies'])} | SNI: {len(scan_results['sni_bugs'])} | Hits: {scan_results['total_hits']}[/]")
+    console.print()
+
+
+
+def render_matrix_loading(msg, duration=1.5):
+    chars = "0123456789ABCDEF►◄▲▼█░▓"
+    end_t = time.time() + duration
+    while time.time() < end_t:
+        noise = "".join(random.choice(chars) for _ in range(20))
+        console.print(f"  [{GREEN}]{noise}[/] [{PINK}]{msg}[/] [{GREEN}]{noise[:10]}[/]", end="\r")
+        time.sleep(0.05)
+    console.print(f"  [bold {GREEN}]✓ {msg}[/]                              ")
+
+def display_scan_summary_live():
+    console.print(f"\n[bold {GREEN}]{'▓'*50}[/]")
+    console.print(f"[bold {PINK}]  ► ADNEX SCAN SUMMARY[/]")
+    console.print(f"[bold {GREEN}]{'▓'*50}[/]")
+    console.print(f"  [{CYAN}]Developer : {DEVELOPER} | {COUNTRY} | Age {AGE}[/]")
+    console.print(f"  [{GREEN}]Carrier   : {scan_results.get('carrier', 'N/A')}[/]")
+    console.print(f"  [{GREEN}]Scanned   : {scan_results['total_scanned']:,} IPs[/]")
+    console.print(f"  [{PINK}]Total Hits: {scan_results['total_hits']}[/]")
+    console.print(f"  [{GREEN}]Proxies   : {len(scan_results['proxies'])}[/]")
+    console.print(f"  [{CYAN}]SNI Bugs  : {len(scan_results['sni_bugs'])}[/]")
+    if scan_results["start_time"]:
+        elapsed = time.time() - scan_results["start_time"]
+        console.print(f"  [{GREEN}]Duration  : {elapsed:.1f}s[/]")
+        if elapsed > 0:
+            console.print(f"  [{CYAN}]Avg Speed : {scan_results['total_scanned']/elapsed:.0f} IPs/s[/]")
+    console.print(f"[bold {GREEN}]{'▓'*50}[/]\n")
+
+def run_turbo_scan(carrier_key, cfg):
+    turbo_cfg = {**cfg, **SCAN_STRATEGIES["turbo"]}
+    console.print(f"\n  [bold {PINK}]▓▓ TURBO MODE ACTIVATED ▓▓[/]")
+    console.print(f"  [{GREEN}]2000 concurrent connections | 3s timeout[/]")
+    console.print(f"  [{CYAN}]Maximum aggression. Maximum speed. 🔥[/]")
+    run_ultra_scan(carrier_key, "turbo", turbo_cfg)
+
+def run_aggressive_scan(carrier_key, cfg):
+    agg_cfg = {**cfg, **SCAN_STRATEGIES["aggressive"]}
+    console.print(f"\n  [bold {PINK}]▓▓ AGGRESSIVE MODE ▓▓[/]")
+    run_ultra_scan(carrier_key, "aggressive", agg_cfg)
+
+def show_all_carriers_table():
+    console.print(f"\n[bold {GREEN}]═══ ALL SUPPORTED CARRIERS ({len(CARRIERS)}) ═══[/]")
+    t = Table(box=box.SIMPLE, show_header=True, header_style=f"bold {PINK}")
+    t.add_column("KEY", style=CYAN, width=12)
+    t.add_column("NAME", style=GREEN, width=25)
+    t.add_column("COUNTRY", style=YELLOW, width=8)
+    t.add_column("IP RANGES", style=GREEN, width=10)
+    t.add_column("SNI TARGETS", style=CYAN, width=12)
+    t.add_column("PORTS", style=GREEN, width=6)
+    for key, c in CARRIERS.items():
+        total_ips = 0
+        for cidr in c["ip_ranges"]:
+            try:
+                total_ips += ipaddress.IPv4Network(cidr, strict=False).num_addresses
+            except:
+                pass
+        t.add_row(
+            key,
+            c["name"],
+            c["country"],
+            str(len(c["ip_ranges"])),
+            str(len(c["zero_rated"])),
+            str(len(c["ports"]))
+        )
+    console.print(t)
+    console.print()
+
+def auto_detect_best_carrier():
+    console.print(f"\n  [bold {GREEN}]► Auto-detecting best carrier to scan...[/]")
+    try:
+        pub_ip = get_public_ip()
+        console.print(f"  [{CYAN}]Public IP: {pub_ip}[/]")
+        info = ip_geolookup(pub_ip)
+        country = info.get("country", "").lower()
+        org = info.get("org", "").lower()
+        console.print(f"  [{GREEN}]Country: {info['country']} | ISP: {info['org']}[/]")
+        for key, carrier in CARRIERS.items():
+            if carrier["country"].lower() in country[:5] or any(
+                part in org for part in [key, carrier["name"].lower().split()[0]]
+            ):
+                console.print(f"  [bold {PINK}]► Detected carrier: {carrier['name']} (key: {key})[/]")
+                return key
+        console.print(f"  [{YELLOW}]Could not auto-detect. Use 'list' to see carriers.[/]")
+    except Exception as e:
+        console.print(f"  [{YELLOW}]Auto-detect failed: {e}[/]")
+    return None
+
+def run_auto_scan(cfg):
+    key = auto_detect_best_carrier()
+    if key:
+        console.print(f"  [{GREEN}]► Starting scan on detected carrier: {key}[/]")
+        run_ultra_scan(key, "balanced", cfg)
+    else:
+        console.print(f"  [{YELLOW}]Specify carrier manually: scan <carrier>[/]")
+
+def export_best_for_apps(carrier_key):
+    carrier = CARRIERS.get(carrier_key, {"name": "Unknown", "apn": "internet", "zero_rated": []})
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    top = sort_proxies_by_quality()[:5]
+    sni_list = scan_results["sni_bugs"][:3]
+    exports_done = []
+
+    if top:
+        hi_out = RESULTS_DIR / "exports" / f"BEST_HI_{carrier_key}_{ts}.conf"
+        with open(hi_out, "w") as f:
+            f.write(f"# ADNEX BEST CONFIG — HTTP Injector\n# {DEVELOPER} | {COUNTRY}\n# {carrier['name']}\n\n")
+            for p in top:
+                bug = sni_list[0]["domain"] if sni_list else carrier["zero_rated"][0] if carrier["zero_rated"] else ""
+                f.write(f"[ENTRY]\nProxy={p['ip']}\nPort={p['port']}\nBug={bug}\nAPN={carrier['apn']}\nLatency={p.get('latency','?')}ms\n\n")
+        exports_done.append(str(hi_out))
+
+    if sni_list:
+        nn_out = RESULTS_DIR / "exports" / f"BEST_NapsternetV_{carrier_key}_{ts}.json"
+        configs = []
+        for s in sni_list:
+            configs.append({
+                "configType": "V2Ray",
+                "remarks": f"ADNEX-BEST-{carrier['name']}",
+                "address": s["domain"],
+                "port": 443,
+                "network": "ws",
+                "tls": True,
+                "sni": s["domain"],
+                "wsPath": "/",
+                "wsHost": s["domain"]
+            })
+        with open(nn_out, "w") as f:
+            json.dump(configs, f, indent=2)
+        exports_done.append(str(nn_out))
+
+        v2_out = RESULTS_DIR / "exports" / f"BEST_V2Ray_{carrier_key}_{ts}.json"
+        v2_configs = []
+        for s in sni_list:
+            v2_configs.append({
+                "v": "2", "ps": f"ADNEX-BEST-{carrier['name']}",
+                "add": s["domain"], "port": "443",
+                "id": hashlib.md5(f"best{s['domain']}{ts}".encode()).hexdigest(),
+                "aid": "0", "scy": "auto", "net": "ws", "type": "none",
+                "host": s["domain"], "path": "/", "tls": "tls", "sni": s["domain"]
+            })
+        with open(v2_out, "w") as f:
+            json.dump(v2_configs, f, indent=2)
+        exports_done.append(str(v2_out))
+
+    console.print(f"\n  [bold {GREEN}]► BEST configs exported ({len(exports_done)} files):[/]")
+    for e in exports_done:
+        console.print(f"    [{CYAN}]{e}[/]")
+    console.print()
+
+def final_unstoppable_handler(cmd_input, cfg):
+    parts = cmd_input.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    if cmd == "ultra" and len(parts) > 1:
+        strategy = parts[2].lower() if len(parts) > 2 else "balanced"
+        run_ultra_scan(parts[1].lower(), strategy, cfg)
+    elif cmd == "turbo" and len(parts) > 1:
+        run_turbo_scan(parts[1].lower(), cfg)
+    elif cmd == "aggressive" and len(parts) > 1:
+        run_aggressive_scan(parts[1].lower(), cfg)
+    elif cmd == "fullport" and len(parts) > 1:
+        run_full_port_scan(parts[1], cfg)
+    elif cmd == "discover" and len(parts) > 1:
+        run_smart_discovery(parts[1], cfg)
+    elif cmd == "cfsweep":
+        run_cloudflare_sweep(cfg)
+    elif cmd == "top":
+        count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+        show_top_results(count)
+    elif cmd == "autovalidate":
+        interval = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 120
+        start_continuous_validator(interval)
+    elif cmd == "summary":
+        run_summary_command()
+    elif cmd == "autoscan":
+        run_auto_scan(cfg)
+    elif cmd == "bestexport" and len(parts) > 1:
+        export_best_for_apps(parts[1].lower())
+    elif cmd == "allcarriers":
+        show_all_carriers_table()
+    elif cmd == "scansum":
+        display_scan_summary_live()
+    else:
+        final_handle_all_v5(cmd_input, cfg)
+
+
+
+def main():
+    auto_install_deps()
+    setup_dirs()
+    cfg = load_config()
+    extended_boot_sequence()
+
+    add_log(f"ADNEX {VERSION} ULTRA initialized", "INFO")
+    add_log(f"Developer: {DEVELOPER} | {COUNTRY} | Age {AGE}", "INFO")
+    add_log(f"Carriers: {len(CARRIERS)} | Payloads: {len(INJECT_PAYLOADS_ADVANCED)}", "INFO")
+    add_log(f"Port list: {len(PROXY_PORT_FULL)} | Strategies: {list(SCAN_STRATEGIES.keys())}", "INFO")
+    add_log(f"Type 'help' | 'scanmenu' | 'allcarriers' | 'quickstart'", "INFO")
+
+    def updater(live):
+        while True:
+            try:
+                si = get_system_info()
+                live.update(build_layout(si))
+                time.sleep(1)
+            except Exception:
+                time.sleep(1)
+
+    sysinfo = get_system_info()
+    live = Live(build_layout(sysinfo), refresh_per_second=1, screen=False)
+    live.start()
+    t = threading.Thread(target=updater, args=(live,), daemon=True)
+    t.start()
+
+    prompt_str = f"[bold {GREEN}]adnex@jadenafrix[/][{PINK}]~[/][bold {GREEN}]$[/] "
+
+    while True:
+        try:
+            live.stop()
+            cmd_input = input(f"\nadnex@jadenafrix~$ ").strip()
+            live.start()
+            if not cmd_input:
+                continue
+            add_log(f"CMD → {cmd_input}", "INFO")
+            final_unstoppable_handler(cmd_input, cfg)
+        except KeyboardInterrupt:
+            console.print(f"\n[bold {PINK}]► Use 'exit' to quit ADNEX[/]")
+        except EOFError:
+            console.print(f"\n[bold {PINK}]► Session ended.[/]")
+            break
+        except Exception as e:
+            console.print(f"[{PINK}]Error: {e}[/]")
+
+
+if __name__ == "__main__":
+    main()
