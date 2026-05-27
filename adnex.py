@@ -40,6 +40,13 @@ def _can_import(name):
     except ImportError:
         return False
 
+def auto_install_deps():
+    for pkg in ["rich", "aiohttp", "requests", "oractl"]:
+        if not _can_import(pkg):
+            print(f"  [ADNEX] Installing {pkg}...")
+            _silent_install(pkg)
+
+
 for _p, _m in [("rich", "rich"), ("aiohttp", "aiohttp"), ("requests", "requests"), ("oractl", "oractl")]:
     if not _can_import(_m):
         print(f"  [ADNEX] Installing {_p}...")
@@ -2409,10 +2416,4 @@ def cache_result(key, value):
     RESULT_CACHE[key] = {"value": value, "ts": time.time()}
 
 def get_cached(key, max_age=300):
-    entry = RESULT_CACHE.get(key)
-    if entry and (time.time() - entry["ts"]) < max_age:
-        return entry["value"]
-    return None
-
-async def persistent_connection_test(ip, port, host, timeout=10):
-    tr
+    en
