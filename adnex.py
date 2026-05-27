@@ -691,6 +691,32 @@ def build_layout(sysinfo):
     layout["footer"].update(Panel(footer_text, border_style=f"dim {GREEN}", padding=(0, 0)))
     return layout
 
+def matrix_rain_effect(duration=2.0):
+    chars = "0123456789ABCDEF"
+    try:
+        width = shutil.get_terminal_size().columns
+    except Exception:
+        width = 60
+    end_t = time.time() + duration
+    while time.time() < end_t:
+        row = "".join(random.choice(chars) if random.random() < 0.1 else " " for _ in range(width))
+        sys.stdout.write("\r" + row[:width])
+        sys.stdout.flush()
+        time.sleep(0.05)
+    sys.stdout.write("\n")
+
+def glitch_text(text, iterations=5):
+    gc = "!@#$%^&*<>?/|~`"
+    for _ in range(iterations):
+        g = "".join(random.choice(gc) if random.random() < 0.15 else ch for ch in text)
+        sys.stdout.write("\r" + g)
+        sys.stdout.flush()
+        time.sleep(0.07)
+    sys.stdout.write("\r" + text + "\n")
+
+def typewriter_print(text, delay=0.03, style=None):
+    console.print(text, style=style or "#00ff41")
+
 def extended_boot_sequence():
     console.clear()
     matrix_rain_effect(1.5)
