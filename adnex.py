@@ -96,8 +96,8 @@ DEVELOPER = "Jaden Afrix"
 COUNTRY = "Zimbabwe"
 AGE = "19"
 TOOL_NAME = "ADNEX"
-VERSION = "v2.0.0"
-YEAR = "2025"
+VERSION = "v0.0.1"
+YEAR = "2026"
 
 GREEN = "#00ff41"
 PINK = "#ff2d78"
@@ -2807,51 +2807,72 @@ def final_unstoppable_handler(cmd_input, cfg):
 
 
 
+
+def print_dashboard():
+    sysinfo = get_system_info()
+    console.print(f"[bold #00ff41]{'═'*60}[/]")
+    console.print(f"[bold #ff2d78]  ADNEX {VERSION} | {DEVELOPER} | {COUNTRY} | Age {AGE}[/]")
+    console.print(f"[bold #00ff41]{'═'*60}[/]")
+    console.print(f"  [#00ffff]OS    :[/] [#00ff41]{sysinfo['platform']}[/]")
+    console.print(f"  [#00ffff]CPU   :[/] [#00ff41]{sysinfo['cpu']}%[/]")
+    console.print(f"  [#00ffff]RAM   :[/] [#00ff41]{sysinfo['ram_used']}GB / {sysinfo['ram_total']}GB ({sysinfo['ram_pct']}%)[/]")
+    console.print(f"  [#00ffff]DISK  :[/] [#00ff41]{sysinfo['disk_used']}GB / {sysinfo['disk_total']}GB[/]")
+    console.print(f"  [#00ffff]STATUS:[/] [#ff2d78]{'SCANNING' if scan_results['scanning'] else 'IDLE'}[/]")
+    console.print(f"  [#00ffff]HITS  :[/] [#ff2d78]{scan_results['total_hits']}[/]  [#00ffff]PROXIES:[/] [#00ff41]{len(scan_results['proxies'])}[/]  [#00ffff]SNI:[/] [#00ff41]{len(scan_results['sni_bugs'])}[/]")
+    console.print(f"  [#00ffff]TIME  :[/] [#00ff41]{datetime.now().strftime('%H:%M:%S')} | {datetime.now().strftime('%a %d %b %Y')}[/]")
+    console.print(f"[bold #00ff41]{'═'*60}[/]")
+    console.print()
+    console.print(f"  [bold #ff2d78]CARRIERS:[/]")
+    for i, (key, val) in enumerate(CARRIERS.items(), 1):
+        console.print(f"    [#00ffff][{i:02d}][/] [#00ff41]{key:<12}[/] [#ffffff]{val['name']} ({val['country']})[/]")
+    console.print()
+    console.print(f"  [bold #ff2d78]COMMANDS:[/]")
+    console.print(f"    [#ff2d78]scan <carrier>[/]    [#00ff41]→ Full scan (e.g: scan econet)[/]")
+    console.print(f"    [#ff2d78]turbo <carrier>[/]   [#00ff41]→ Max speed scan[/]")
+    console.print(f"    [#ff2d78]deepsni <carrier>[/] [#00ff41]→ SNI only scan[/]")
+    console.print(f"    [#ff2d78]results[/]           [#00ff41]→ Show results[/]")
+    console.print(f"    [#ff2d78]exportall <carrier>[/] [#00ff41]→ Export configs[/]")
+    console.print(f"    [#ff2d78]stop[/]              [#00ff41]→ Stop scan[/]")
+    console.print(f"    [#ff2d78]status[/]            [#00ff41]→ Scan status[/]")
+    console.print(f"    [#ff2d78]list[/]              [#00ff41]→ List carriers[/]")
+    console.print(f"    [#ff2d78]help[/]              [#00ff41]→ All commands[/]")
+    console.print(f"    [#ff2d78]clear[/]             [#00ff41]→ Clear screen[/]")
+    console.print(f"    [#ff2d78]exit[/]              [#00ff41]→ Quit[/]")
+    console.print(f"[bold #00ff41]{'═'*60}[/]")
+    console.print()
+
+
 def main():
     auto_install_deps()
     setup_dirs()
     cfg = load_config()
     extended_boot_sequence()
-
-    add_log(f"ADNEX {VERSION} ULTRA initialized", "INFO")
-    add_log(f"Developer: {DEVELOPER} | {COUNTRY} | Age {AGE}", "INFO")
-    add_log(f"Carriers: {len(CARRIERS)} | Payloads: {len(INJECT_PAYLOADS_ADVANCED)}", "INFO")
-    add_log(f"Port list: {len(PROXY_PORT_FULL)} | Strategies: {list(SCAN_STRATEGIES.keys())}", "INFO")
-    add_log(f"Type 'help' | 'scanmenu' | 'allcarriers' | 'quickstart'", "INFO")
-
-    def updater(live):
-        while True:
-            try:
-                si = get_system_info()
-                live.update(build_layout(si))
-                time.sleep(1)
-            except Exception:
-                time.sleep(1)
-
-    sysinfo = get_system_info()
-    live = Live(build_layout(sysinfo), refresh_per_second=1, screen=False)
-    live.start()
-    t = threading.Thread(target=updater, args=(live,), daemon=True)
-    t.start()
-
-    prompt_str = f"[bold {GREEN}]adnex@jadenafrix[/][{PINK}]~[/][bold {GREEN}]$[/] "
+    print_dashboard()
 
     while True:
         try:
-            live.stop()
-            cmd_input = input(f"\nadnex@jadenafrix~$ ").strip()
-            live.start()
+            sys.stdout.write("adnex@jadenafrix~$ ")
+            sys.stdout.flush()
+            cmd_input = sys.stdin.readline()
+            if cmd_input is None:
+                break
+            cmd_input = cmd_input.strip()
             if not cmd_input:
                 continue
             add_log(f"CMD → {cmd_input}", "INFO")
-            final_unstoppable_handler(cmd_input, cfg)
+            if cmd_input.lower() == "clear":
+                console.clear()
+                print_dashboard()
+            elif cmd_input.lower() == "dashboard":
+                print_dashboard()
+            else:
+                final_unstoppable_handler(cmd_input, cfg)
         except KeyboardInterrupt:
-            console.print(f"\n[bold {PINK}]► Use 'exit' to quit ADNEX[/]")
+            console.print(f"\n[bold #ff2d78]► Use 'exit' to quit ADNEX[/]")
         except EOFError:
-            console.print(f"\n[bold {PINK}]► Session ended.[/]")
             break
         except Exception as e:
-            console.print(f"[{PINK}]Error: {e}[/]")
+            console.print(f"[#ff2d78]Error: {e}[/]")
 
 
 if __name__ == "__main__":
