@@ -288,24 +288,49 @@ async def _check_socks5(ip, port, timeout):
         pass
     return None
 
-async def _probe_sni(domain, timeout):
+async def _probe_sni_on_ip(ip, sni_host, timeout):
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         r,w = await asyncio.wait_for(
-            asyncio.open_connection(domain,443,ssl=ctx,server_hostname=domain),
+            asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=sni_host),
             timeout=timeout
         )
-        w.write(b"HEAD / HTTP/1.1\r\nHost: "+domain.encode()+b"\r\nConnection: close\r\n\r\n")
+        w.write(b"HEAD / HTTP/1.1\r\nHost: "+sni_host.encode()+b"\r\nConnection: close\r\n\r\n")
         await w.drain()
-        resp = await asyncio.wait_for(r.read(512),timeout=timeout)
+        resp = await asyncio.wait_for(r.read(512), timeout=timeout)
         w.close()
-        if resp:
+        if resp and len(resp) > 10:
             first = resp.decode(errors="ignore").split("\r\n")[0]
-            return {"domain":domain,"type":"SNI","response":first,"status":"ACTIVE"}
+            if any(c in first for c in ["200","301","302","304","403","101"]):
+                return {"ip":ip,"domain":sni_host,"type":"SNI_BUG","response":first,"status":"ACTIVE"}
     except Exception:
         pass
+    return None
+
+async def _probe_http_inject(ip, host, timeout):
+    payloads = [
+        f"GET / HTTP/1.1\r\nHost: {host}\r\nX-Online-Host: {host}\r\nConnection: keep-alive\r\n\r\n",
+        f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+        f"GET http://{host}/ HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n",
+    ]
+    for i, payload in enumerate(payloads):
+        try:
+            r,w = await asyncio.wait_for(asyncio.open_connection(ip,80),timeout=timeout)
+            w.write(payload.encode())
+            await w.drain()
+            resp = await asyncio.wait_for(r.read(512),timeout=timeout)
+            w.close()
+            if resp and len(resp) > 10:
+                first = resp.decode(errors="ignore").split("\r\n")[0]
+                if any(c in first for c in ["200","301","302","304","403","101"]):
+                    return {"ip":ip,"domain":host,"type":f"HTTP_INJECT_{i+1}","response":first,"status":"ACTIVE"}
+        except Exception:
+            pass
+    return None
+
+async def _probe_sni(domain, timeout):
     return None
 
 async def _probe_payload(ip, port, host, timeout):
@@ -325,19 +350,34 @@ async def _probe_payload(ip, port, host, timeout):
             pass
     return None
 
-async def _scan_ip(semaphore, session, ip, ports, host, timeout):
+async def _scan_ip(semaphore, session, ip, ports, sni_hosts, timeout):
     async with semaphore:
         scan_state["scanned"] += 1
-        t0 = time.time()
-        scan_state["speed"] = int(scan_state["scanned"] / max(time.time() - (scan_state["start_time"] or t0), 1))
+        elapsed = max(time.time() - (scan_state["start_time"] or time.time()), 1)
+        scan_state["speed"] = int(scan_state["scanned"] / elapsed)
         results = []
-        tasks = [_check_proxy_http(session, ip, p, timeout) for p in ports]
-        tasks += [_check_proxy_connect(ip, p, timeout) for p in ports]
-        tasks += [_probe_payload(ip, p, host, timeout) for p in ports]
-        done = await asyncio.gather(*tasks, return_exceptions=True)
+
+        proxy_tasks = [_check_proxy_http(session, ip, p, timeout) for p in ports]
+        proxy_tasks += [_check_proxy_connect(ip, p, timeout) for p in ports]
+        done = await asyncio.gather(*proxy_tasks, return_exceptions=True)
         for r in done:
             if r and isinstance(r, dict) and r.get("status") == "WORKING":
                 results.append(r)
+                scan_state["proxies"].append(r)
+                scan_state["hits"] += 1
+                log(f"PROXY → {ip}:{r['port']} [{r['type']}] {r['latency']}ms", "HIT")
+
+        sni_tasks = [_probe_sni_on_ip(ip, host, timeout) for host in sni_hosts]
+        sni_tasks += [_probe_http_inject(ip, host, timeout) for host in sni_hosts]
+        sni_done = await asyncio.gather(*sni_tasks, return_exceptions=True)
+        for r in sni_done:
+            if r and isinstance(r, dict) and r.get("status") == "ACTIVE":
+                already = any(x["ip"]==ip and x["domain"]==r["domain"] for x in scan_state["sni"])
+                if not already:
+                    scan_state["sni"].append(r)
+                    scan_state["hits"] += 1
+                    log(f"SNI BUG → {ip} | {r['domain']} | {r['response'][:40]}", "SNI")
+
         return results
 
 async def _run_scan_async(carrier_key, strategy_name, cfg):
@@ -359,17 +399,7 @@ async def _run_scan_async(carrier_key, strategy_name, cfg):
 
     host = carrier["zero_rated"][0] if carrier["zero_rated"] else f"www.{carrier_key}.com"
 
-    sni_sem = asyncio.Semaphore(30)
-    async def sni_worker(domain):
-        async with sni_sem:
-            r = await _probe_sni(domain, timeout)
-            if r:
-                scan_state["sni"].append(r)
-                scan_state["hits"] += 1
-                log(f"SNI HIT → {domain}", "SNI")
-
-    sni_tasks = [sni_worker(d) for d in carrier["zero_rated"]]
-    await asyncio.gather(*sni_tasks, return_exceptions=True)
+    log(f"SNI candidates queued: {len(carrier['zero_rated'])} carrier domains + {len(COMMON_SNI)} global CDN domains", "INFO")
 
     all_ips = []
     for cidr in carrier["ip_ranges"]:
@@ -379,22 +409,18 @@ async def _run_scan_async(carrier_key, strategy_name, cfg):
     random.shuffle(all_ips)
     log(f"Total IPs: {len(all_ips)}", "INFO")
 
+    sni_hosts = carrier["zero_rated"] + COMMON_SNI[:10]
+
     semaphore = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(ssl=False, limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
-        batch = 2000
+        batch = 500
         for i in range(0, len(all_ips), batch):
             if not scan_state["scanning"]:
                 break
             chunk = all_ips[i:i+batch]
-            tasks = [_scan_ip(semaphore, session, ip, carrier["ports"], host, timeout) for ip in chunk]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, list):
-                    for r in res:
-                        scan_state["proxies"].append(r)
-                        scan_state["hits"] += 1
-                        log(f"PROXY HIT → {r['ip']}:{r['port']} [{r['type']}] {r['latency']}ms", "HIT")
+            tasks = [_scan_ip(semaphore, session, ip, carrier["ports"], sni_hosts, timeout) for ip in chunk]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     scan_state["scanning"] = False
     log(f"SCAN COMPLETE → {scan_state['hits']} hits | {scan_state['scanned']} IPs scanned", "HIT")
