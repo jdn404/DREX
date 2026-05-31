@@ -104,10 +104,10 @@ CARRIERS = {
 CARRIER_KEYS = list(CARRIERS.keys())
 
 SCAN_STRATEGIES = {
-    "turbo":      {"concurrency":2000,"timeout":3},
-    "aggressive": {"concurrency":1000,"timeout":5},
-    "balanced":   {"concurrency":500, "timeout":8},
-    "stealth":    {"concurrency":100, "timeout":12},
+    "turbo":      {"concurrency":150,"timeout":5},
+    "aggressive": {"concurrency":100,"timeout":6},
+    "balanced":   {"concurrency":50,  "timeout":8},
+    "stealth":    {"concurrency":20,  "timeout":12},
 }
 
 PAYLOADS = {
@@ -168,7 +168,7 @@ def setup_dirs():
         (RESULTS_DIR / d).mkdir(parents=True, exist_ok=True)
 
 def load_config():
-    defaults = {"concurrency":500,"timeout":8,"retry":2,"save_auto":True}
+    defaults = {"concurrency":50,"timeout":8,"retry":2,"save_auto":True}
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
@@ -232,7 +232,7 @@ def get_sysinfo():
         pass
     return base
 
-def expand_cidr(cidr, max_hosts=5000):
+def expand_cidr(cidr, max_hosts=500):
     try:
         net = ipaddress.IPv4Network(cidr, strict=False)
         hosts = [str(h) for h in net.hosts()]
@@ -928,28 +928,52 @@ def handle(cmd_input, cfg):
         console.print(f"  [{G}]► Shortcut: scan {carrier}[/]")
         cmd_scan(carrier, "balanced", cfg)
 
+    elif resolve_carrier(cmd):
+        carrier = resolve_carrier(cmd)
+        console.print(f"  [{G}]► Scanning {carrier}...[/]")
+        cmd_scan(carrier, "balanced", cfg)
+
     else:
-        console.print(f"  [{P}]Unknown command: '{cmd}'[/]  [{G}]Type 'help'[/]")
+        console.print(f"  [{P}]Unknown command: '{cmd}'[/]  [{G}]Type 'help' or 'list'[/]")
+
+def _status_ticker(stop_event):
+    while not stop_event.is_set():
+        if scan_state["scanning"]:
+            sys.stdout.write(
+                f"\r  [SCANNING] {scan_state['carrier']} | "
+                f"Scanned: {scan_state['scanned']:,} | "
+                f"Hits: {scan_state['hits']} | "
+                f"Speed: {scan_state['speed']}/s   "
+            )
+            sys.stdout.flush()
+        time.sleep(2)
 
 def main():
     setup_dirs()
     cfg = load_config()
     boot_sequence()
     print_dashboard()
+    stop_ticker = threading.Event()
+    ticker = threading.Thread(target=_status_ticker, args=(stop_ticker,), daemon=True)
+    ticker.start()
     while True:
         try:
-            sys.stdout.write(f"adnex~$ ")
+            sys.stdout.write("\nadnex~$ ")
             sys.stdout.flush()
             line = sys.stdin.readline()
             if not line:
                 break
             cmd = line.strip()
-            if cmd:
-                handle(cmd, cfg)
+            if not cmd:
+                continue
+            if scan_state["scanning"]:
+                sys.stdout.write("\n")
+            handle(cmd, cfg)
         except KeyboardInterrupt:
-            console.print(f"\n  [{P}]► Ctrl+C detected. Type 'exit' to quit.[/]")
+            console.print(f"\n  [{P}]Ctrl+C — type 'exit' to quit or 'stop' to stop scan.[/]")
         except Exception as e:
             console.print(f"  [{P}]Error: {e}[/]")
+    stop_ticker.set()
 
 if __name__ == "__main__":
     main()
